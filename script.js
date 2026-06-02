@@ -9,9 +9,18 @@
   const filterHint = document.getElementById('filter-hint');
   const saveBtn = document.getElementById('save-btn');
   const saveBtnLabel = saveBtn.querySelector('.btn__label');
+  const sortSelect = document.getElementById('sort-order');
+  const statTotal = document.getElementById('stat-total');
+  const statToday = document.getElementById('stat-today');
+  const statWeek = document.getElementById('stat-week');
+  const deleteDialog = document.getElementById('delete-dialog');
+  const deleteCancel = document.getElementById('delete-cancel');
+  const deleteConfirm = document.getElementById('delete-confirm');
 
   let allRequests = [];
   let searchQuery = '';
+  let sortOrder = 'desc';
+  let pendingDeleteId = null;
 
   function getConfig() {
     return window.CONFIG || null;
@@ -105,16 +114,66 @@
     return data;
   }
 
-  function formatDate(iso) {
-    if (!iso) return '—';
+  function parseCreatedAt(iso) {
+    if (!iso) return null;
     const date = new Date(iso);
-    if (Number.isNaN(date.getTime())) return iso;
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  function isValidRequest(r) {
+    return !!(r && r.id && String(r.id).trim());
+  }
+
+  function startOfLocalDay(date) {
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  }
+
+  function computeStats() {
+    const valid = allRequests.filter(isValidRequest);
+    const now = new Date();
+    const todayStart = startOfLocalDay(now);
+    const weekStart = new Date(todayStart);
+    weekStart.setDate(weekStart.getDate() - 6);
+
+    let today = 0;
+    let week = 0;
+
+    valid.forEach(function (r) {
+      const created = parseCreatedAt(r.createdAt);
+      if (!created) return;
+      if (created >= todayStart) today++;
+      if (created >= weekStart) week++;
+    });
+
+    return { total: valid.length, today: today, week: week };
+  }
+
+  function updateStats() {
+    const stats = computeStats();
+    statTotal.textContent = String(stats.total);
+    statToday.textContent = String(stats.today);
+    statWeek.textContent = String(stats.week);
+  }
+
+  function formatDate(iso) {
+    const date = parseCreatedAt(iso);
+    if (!date) return iso ? String(iso) : '—';
     return date.toLocaleString('ru-RU', {
       day: '2-digit',
       month: '2-digit',
       year: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
+    });
+  }
+
+  function sortByDate(list) {
+    return list.slice().sort(function (a, b) {
+      const ta = parseCreatedAt(a.createdAt);
+      const tb = parseCreatedAt(b.createdAt);
+      const timeA = ta ? ta.getTime() : 0;
+      const timeB = tb ? tb.getTime() : 0;
+      return sortOrder === 'desc' ? timeB - timeA : timeA - timeB;
     });
   }
 
@@ -128,14 +187,18 @@
 
   function filteredRequests() {
     const q = searchQuery.trim().toLowerCase();
-    if (!q) return allRequests;
-    return allRequests.filter(function (r) {
-      return r.name.toLowerCase().includes(q);
-    });
+    let list = allRequests.filter(isValidRequest);
+    if (q) {
+      list = list.filter(function (r) {
+        return r.name.toLowerCase().includes(q);
+      });
+    }
+    return sortByDate(list);
   }
 
   function renderTable() {
     const list = filteredRequests();
+    updateStats();
     const q = searchQuery.trim();
 
     if (list.length === 0) {
@@ -190,7 +253,7 @@
   async function loadRequests() {
     setStatus('Загрузка…', 'info');
     const data = await apiCall({ action: 'list' });
-    allRequests = data.requests || [];
+    allRequests = (data.requests || []).filter(isValidRequest);
     renderTable();
     setStatus('');
   }
@@ -205,7 +268,11 @@
     if (data.request) {
       allRequests.unshift(data.request);
       renderTable();
+      if (data.request.telegram && !data.request.telegram.ok) {
+        return data.request.telegram;
+      }
     }
+    return { ok: true };
   }
 
   async function deleteRequest(id) {
@@ -226,10 +293,17 @@
 
     try {
       const fd = new FormData(form);
-      await createRequest(fd);
+      const telegramResult = await createRequest(fd);
       form.reset();
-      setStatus('Заявка сохранена', 'success', 'form');
-      setStatus('');
+      if (telegramResult && !telegramResult.ok) {
+        setStatus(
+          'Заявка в таблице сохранена, но Telegram: ' + telegramResult.message,
+          'error',
+          'form'
+        );
+      } else {
+        setStatus('Заявка сохранена', 'success', 'form');
+      }
       setTimeout(function () {
         if (formStatusEl.textContent === 'Заявка сохранена') setStatus('', '', 'form');
       }, 4000);
@@ -246,15 +320,26 @@
     renderTable();
   });
 
-  tbody.addEventListener('click', async function (e) {
-    const btn = e.target.closest('.btn-delete');
-    if (!btn) return;
+  sortSelect.addEventListener('change', function () {
+    sortOrder = sortSelect.value === 'asc' ? 'asc' : 'desc';
+    renderTable();
+  });
 
-    const id = btn.dataset.id;
-    if (!id) return;
-    if (!confirm('Удалить эту заявку?')) return;
+  function openDeleteDialog(id) {
+    pendingDeleteId = id;
+    if (deleteDialog.showModal) {
+      deleteDialog.showModal();
+    } else if (window.confirm('Вы уверены?')) {
+      runDelete(id);
+    }
+  }
 
-    btn.disabled = true;
+  function closeDeleteDialog() {
+    pendingDeleteId = null;
+    if (deleteDialog.open) deleteDialog.close();
+  }
+
+  async function runDelete(id) {
     setStatus('Удаление…', 'info');
 
     try {
@@ -265,13 +350,35 @@
       }, 2500);
     } catch (err) {
       setStatus(err.message || 'Не удалось удалить', 'error');
-      btn.disabled = false;
     }
+  }
+
+  deleteCancel.addEventListener('click', closeDeleteDialog);
+
+  deleteDialog.addEventListener('close', function () {
+    pendingDeleteId = null;
+  });
+
+  deleteDialog.querySelector('form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    const id = pendingDeleteId;
+    closeDeleteDialog();
+    if (id) runDelete(id);
+  });
+
+  tbody.addEventListener('click', function (e) {
+    const btn = e.target.closest('.btn-delete');
+    if (!btn) return;
+
+    const id = btn.dataset.id;
+    if (!id) return;
+    openDeleteDialog(id);
   });
 
   loadRequests().catch(function (err) {
     setStatus(err.message || 'Не удалось загрузить заявки', 'error');
     tbody.innerHTML =
       '<tr class="table__empty"><td colspan="5">Ошибка загрузки</td></tr>';
+    updateStats();
   });
 })();
